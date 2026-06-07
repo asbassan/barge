@@ -136,6 +136,8 @@ func stepContainers() (string, error) {
 // stepInstallContainerd downloads and installs containerd if not already present.
 func stepInstallContainerd() (string, error) {
 	if _, err := os.Stat(containerdExe); err == nil {
+		// Still remove a BOM-tainted config.toml in case a previous run left one.
+		_ = os.Remove(filepath.Join(containerdDir, "config.toml"))
 		return "already installed", nil
 	}
 
@@ -164,6 +166,11 @@ func stepInstallContainerd() (string, error) {
 	if err := downloadAndExtract(downloadURL, containerdDir); err != nil {
 		return "", fmt.Errorf("download/extract failed: %w", err)
 	}
+
+	// Remove any config.toml shipped in the archive — some containerd releases
+	// include one with a UTF-8 BOM that breaks the TOML parser at registration
+	// time. Containerd runs correctly on built-in defaults without a config file.
+	_ = os.Remove(filepath.Join(containerdDir, "config.toml"))
 
 	fmt.Println("        Registering containerd service ...")
 	out, err := exec.Command(containerdExe, "--register-service").CombinedOutput()
