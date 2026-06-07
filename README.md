@@ -115,8 +115,7 @@ barge rm -f myapp
 | `barge rm <id>` | Remove a stopped container |
 | `barge rm -f <id>` | Force-remove a running container |
 | `barge exec -i <id> cmd.exe` | Open a shell in a running container |
-| `barge logs <id>` | Show logs from a detached container |
-| `barge logs -f <id>` | Follow logs in real time |
+| `barge logs <id>` | Not yet working — detached containers use NullIO (see Notes) |
 | `barge commit <id> <image>` | Save container state as a new image |
 | `barge tag <src> <dst>` | Tag an image |
 | `barge push <image>` | Push an image to a registry |
@@ -153,3 +152,7 @@ NanoServer does not include PowerShell.
   Foreground containers are always removed automatically on exit.
 - Re-running with `--name X` when a container named `X` already exists fails
   with a clear error. Remove it first with `barge rm X`.
+- `barge logs` does not currently work. The Windows container shim rejects
+  `file://` log URIs, so detached containers use null I/O — their output is not
+  captured to a file. To see output from a detached container today, use
+  `barge exec -i <id> cmd.exe` and run the process interactively.

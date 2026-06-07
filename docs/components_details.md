@@ -20,7 +20,7 @@ missing compared to Docker.
 | `barge ps [-a]` | Working |
 | `barge stop <id>` | Working |
 | `barge rm [-f] <id>` | Working |
-| `barge logs [-f] <id>` | Working — tails log file written by detached container |
+| `barge logs [-f] <id>` | Not working — Windows shim rejects file:// log URIs; detached containers use NullIO |
 | `barge exec [-i] <id> <cmd>` | Working — interactive and non-interactive |
 | `barge build [-t] [--build-arg]` | Working — executes Bargefile instructions |
 | `barge commit <id> <image>` | Working — snapshots container filesystem as new image |
@@ -213,8 +213,9 @@ type Runtime interface {
 3. Attaches HCN network endpoint (port NAT rules applied here)
 4. Applies VSMB volume mounts (empty `Type` field — runhcs converts to VSMB)
 5. Creates the container and its task
-6. For detached containers: creates log dir, uses `cio.LogFile(path)`, stores log
-   path in container label `barge.logfile`
+6. For detached containers: uses `cio.NullIO` — the Windows shim rejects
+   `file://` log URIs, so output is not captured. The `barge.logfile` label
+   is not set; `barge logs` does not work as a result.
 7. For foreground containers: uses `cio.WithStdio`, waits for exit
 
 **Key labels stored on every container:**
