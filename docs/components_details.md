@@ -16,7 +16,7 @@ missing compared to Docker.
 | `barge pull <image>` | Working — MCR, Docker Hub, private registries |
 | `barge images` | Working |
 | `barge rmi <image>` | Working |
-| `barge run` | Working — detach, port publish, volume mount, env vars, env-file |
+| `barge run` | Working — detach, port publish, volume mount, env vars, env-file, memory limit |
 | `barge ps [-a]` | Working |
 | `barge stop <id>` | Working |
 | `barge rm [-f] <id>` | Working |
@@ -85,7 +85,7 @@ of a cryptic pipe failure when containerd is not running.
 | `pull <image>` | — | `client.Pull()` |
 | `images` | — | `client.ListImages()` |
 | `rmi <image...>` | — | `client.RemoveImage()` |
-| `run <image>` | `--name`, `-d`, `--rm`, `-e`, `--env-file`, `-v`, `-p`, `--isolation` | `client.Run()` |
+| `run <image>` | `--name`, `-d`, `--rm`, `-e`, `--env-file`, `-v`, `-p`, `--isolation`, `--memory`/`-m` | `client.Run()` |
 | `ps` | `-a` | `client.ListContainers()` |
 | `stop <id...>` | — | `client.StopContainer()` |
 | `rm <id...>` | `-f` | `client.RemoveContainer()` |
@@ -103,17 +103,28 @@ of a cryptic pipe failure when containerd is not running.
 ### The `run` Command — Flag Detail
 
 ```
-barge run [flags] <image> [-- command args...]
+barge run [flags] <image> [command args...]
 ```
 
-The `--` separator splits the image name from the command override:
+Everything after the image name is treated as the container command and its
+arguments. No `--` separator is needed — cobra stops flag parsing at the first
+non-flag positional argument (the image name) because `SetInterspersed(false)` is
+set. This means flags like `-t` and `-n` that belong to the container command pass
+through correctly:
 
 ```
-barge run myimage:latest -- powershell -Command Get-Process
+barge run myimage:latest powershell -Command Get-Process
+barge run -d tessa1:v1 ping -t 127.0.0.1
 ```
 
 `--isolation` (default: `hyperv`) maps to `IsolationHyperV` or `IsolationProcess`
 and flows into the OCI spec via `withHyperVIsolation()`.
+
+`--memory` / `-m` sets the Hyper-V VM memory limit. Accepts human-readable
+suffixes: `512m`, `2g`, `1024k`, or a raw byte count. Stored as
+`s.Windows.Resources.Memory.Limit` (uint64, bytes) in the OCI spec.
+Without this flag, Hyper-V uses dynamic memory — the VM starts with a minimum
+allocation (~512 MB) and the host assigns more as needed, up to available RAM.
 
 `--env-file` reads a file of `KEY=VALUE` lines, skipping `#` comments and blank
 lines. Lines are merged with `-e` flags; `-e` takes precedence.
@@ -123,6 +134,11 @@ Volume mounts (`-v`) accept:
 - `C:\host\path:C:\container\path:ro` — read-only
 
 Port mappings (`-p`) accept: `hostPort:containerPort`.
+
+**Container naming and re-use:** if `--name X` is given and a container named `X`
+already exists (even in stopped state), `barge run` fails with a clear error and
+instructs the user to `barge rm X` first. Detached containers persist until
+explicitly removed; foreground containers are always auto-removed on exit.
 
 ---
 
@@ -433,6 +449,44 @@ of every build).
 
 ---
 
+## Windows-Specific Behaviors
+
+These behaviors differ from Docker on Linux and are not bugs:
+
+| Behavior | Reason |
+|----------|--------|
+| `COPY` requires PowerShell inside the image | Hyper-V isolation prevents host bind mounts; BARGE uses HTTP zip transfer instead. NanoServer images lack PowerShell — use ServerCore. |
+| Detached containers use `NullIO` (no log file) | `containerd-shim-runhcs-v1` rejects `file://` URIs; only `binary://` or null I/O is accepted. Output from `RUN` steps is still visible via `Exec` which uses host stdio. |
+| Committed image-layer snapshots cannot be mounted directly | Only `active` or `view` snapshots are mountable on Windows. `CommitContainer` creates a temporary view snapshot for the diff computation, then removes it. |
+| OCI DiffID must be SHA256 of the **uncompressed** tar | The Windows diff plugin does not set the `containerd.io/uncompressed` annotation. BARGE decompresses the gzip blob on the fly to compute the correct DiffID. |
+| Foreground containers are always auto-removed on exit | Leaving a stopped foreground container's snapshot in the store would prevent re-running with the same name. Detached containers persist until `barge rm`. |
+| Hyper-V memory is dynamic by default | Without `--memory`, HCS assigns the VM ~512 MB minimum and grows it as needed. Use `-m 2g` to set a hard cap. |
+
+---
+
+## v0.1.0 Bug Fix Summary
+
+All bugs encountered and fixed during initial end-to-end testing. Full details in `tsg/bugs/v0.1.0.md`.
+
+| Bug | Symptom | Root Cause | Fix |
+|-----|---------|-----------|-----|
+| BUG-01 | `unknown shorthand flag: 'f' in -f` | `StringVar` instead of `StringVarP` | Changed to `StringVarP` |
+| BUG-03 | `invalid port ":3.11-..."` | Short Docker Hub refs parsed as URLs | Added `normalizeRef()` in `images.go` |
+| BUG-04 | `scheme must be 'binary', got: 'file'` | `cio.LogFile` rejected by Windows shim | Detached containers use `cio.NullIO` |
+| BUG-05 | `invalid archive entry '.'` (single-file COPY) | `filepath.Rel(file, file)` returns `.` | `zipDir()` now handles files vs directories separately |
+| BUG-06 | `The system cannot find the path specified` after WORKDIR | WORKDIR recorded but directory not created | `WORKDIR` now execs `New-Item -Force` in the container |
+| BUG-07 | `invalid archive entry '.'` (relative dst) | `./` not resolved against WORKDIR | Added `resolveCopyDst()` |
+| BUG-08 | `snapshot not active or view: failed precondition` | Called `Mounts()` on committed snapshot | Use a temporary view snapshot for diff lower |
+| BUG-09 | Locally built images not found by `barge run` | `normalizeRef` always applied, but local builds use original name | `GetImage` tries normalized, then falls back to original |
+| BUG-10 | `content digest: not found` after build | Image record created but never `Unpack()`'d | Call `img.Unpack(ctx, windowsSnapshotter)` after commit |
+| BUG-11 | `wrong diff id calculated on extraction` | Windows diff plugin omits `containerd.io/uncompressed` annotation | `uncompressedDigest()` decompresses gzip blob, hashes raw tar |
+| BUG-12 | `content digest: not found` (GC eviction) | Delete→Create race window allowed GC to evict config blob | `gc.root` labels on all blobs + atomic Create/Update image record |
+| BUG-13 | `snapshot already exists` on re-run | Foreground containers left snapshot behind after exit | Foreground containers always auto-cleanup on exit |
+| BUG-14 | `unknown shorthand flag: 't'` for container args | Cobra parsed container flags as barge flags | `SetInterspersed(false)` on `run` and `exec` commands |
+| BUG-15 | `container named "X" already exists` (no remedy shown) | Detached stopped containers leave record+snapshot | `Run()` checks for existing container and returns actionable error |
+
+---
+
 ## What Is Not Yet Implemented
 
 ### Exec + Commit Workflow (Live Container Modification)
@@ -511,7 +565,8 @@ Features present in Docker that BARGE does not yet have:
 | `docker port` — list port mappings | Not implemented |
 | `docker export` / `docker import` | Not implemented |
 | `docker save` / `docker load` | Not implemented |
-| Resource limits (`--memory`, `--cpus`) | Not implemented |
+| `--memory` memory limit | Implemented — `barge run -m 2g` |
+| `--cpus` CPU quota | Not implemented |
 | Restart policies (`--restart always`) | Not implemented |
 | `--user` flag | Not implemented |
 

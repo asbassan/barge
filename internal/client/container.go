@@ -197,8 +197,8 @@ func (cl *Client) Logs(ctx context.Context, id string, follow bool) error {
 	if !ok || logPath == "" {
 		return fmt.Errorf(
 			"no log file for container %q\n\n"+
-				"  Logs are only captured for containers started with -d (detach).\n"+
-				"  Foreground containers write directly to your terminal.",
+				"  Windows containers use NullIO for detached mode — output is not captured.\n"+
+				"  To see output, run without -d: barge run <image> -- <command>",
 			id,
 		)
 	}

@@ -50,44 +50,57 @@ func newFileServer(srcDir string) (*fileServer, int, error) {
 
 func (fs *fileServer) Close() { _ = fs.server.Close() }
 
-// zipDir builds an in-memory zip archive of all files under dir.
-func zipDir(dir string) ([]byte, error) {
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
-		// Always use forward slashes inside the zip so PowerShell's
-		// Expand-Archive handles the entry names cross-platform.
-		rel = strings.ReplaceAll(rel, "\\", "/")
-
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
-		w, err := zw.Create(rel)
-		if err != nil {
-			return err
-		}
-		_, err = io.Copy(w, f)
-		return err
-	})
+// zipDir builds an in-memory zip archive of src.
+// If src is a single file it is zipped under its base name.
+// If src is a directory all files inside are zipped with relative paths.
+func zipDir(src string) ([]byte, error) {
+	info, err := os.Stat(src)
 	if err != nil {
 		return nil, err
 	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	if !info.IsDir() {
+		// Single file: zip it under its base name so Expand-Archive produces
+		// dst\filename, not dst\. (filepath.Rel(file, file) == "." which is invalid).
+		if err := addFileToZip(zw, src, info.Name()); err != nil {
+			return nil, err
+		}
+	} else {
+		err = filepath.Walk(src, func(path string, fi os.FileInfo, err error) error {
+			if err != nil || fi.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(src, path)
+			if err != nil {
+				return err
+			}
+			rel = strings.ReplaceAll(rel, "\\", "/")
+			return addFileToZip(zw, path, rel)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if err := zw.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func addFileToZip(zw *zip.Writer, path, name string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, f)
+	return err
 }

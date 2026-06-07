@@ -123,6 +123,13 @@ func (b *Builder) Build(ctx context.Context, bf *Bargefile, contextDir, outputRe
 			dir := substituteArgs(instr.Args[0], state.args)
 			state.workDir = dir
 			output.Infof("Step %d/N: WORKDIR %s", step, dir)
+			// Create the directory inside the container — it may not exist yet.
+			winDir := toWindowsPath(dir)
+			mkCmd := fmt.Sprintf("New-Item -ItemType Directory -Force '%s' | Out-Null", winDir)
+			_ = b.cl.Exec(ctx, client.ExecOptions{
+				ContainerID: buildID,
+				Args:        []string{"powershell.exe", "-NonInteractive", "-Command", mkCmd},
+			})
 			step++
 
 		case InstrEXPOSE:
@@ -137,7 +144,7 @@ func (b *Builder) Build(ctx context.Context, bf *Bargefile, contextDir, outputRe
 			src := filepath.Join(contextDir, substituteArgs(instr.Args[0], state.args))
 			dst := substituteArgs(instr.Args[1], state.args)
 			output.Infof("Step %d/N: COPY %s → %s", step, instr.Args[0], dst)
-			if err := b.execCopy(ctx, buildID, src, dst); err != nil {
+			if err := b.execCopy(ctx, buildID, src, dst, state.workDir); err != nil {
 				return fmt.Errorf("COPY %s %s: %w", instr.Args[0], dst, err)
 			}
 			step++
@@ -174,7 +181,7 @@ func (b *Builder) Build(ctx context.Context, bf *Bargefile, contextDir, outputRe
 // It starts a temporary HTTP server, then execs PowerShell in the container to
 // download and extract the archive — the only reliable COPY mechanism for
 // Hyper-V isolated containers (bind mounts are not supported).
-func (b *Builder) execCopy(ctx context.Context, containerID, src, dst string) error {
+func (b *Builder) execCopy(ctx context.Context, containerID, src, dst, workDir string) error {
 	srv, port, err := newFileServer(src)
 	if err != nil {
 		return err
@@ -186,7 +193,7 @@ func (b *Builder) execCopy(ctx context.Context, containerID, src, dst string) er
 		return fmt.Errorf("cannot determine host IP: %w", err)
 	}
 
-	winDst := toWindowsPath(dst)
+	winDst := resolveCopyDst(dst, workDir)
 	url := fmt.Sprintf("http://%s:%d/archive.zip", gatewayIP, port)
 
 	psCmd := fmt.Sprintf(
@@ -223,4 +230,33 @@ func toWindowsPath(path string) string {
 		path = "C:" + path
 	}
 	return strings.ReplaceAll(path, "/", "\\")
+}
+
+// resolveCopyDst resolves a COPY destination against the current WORKDIR.
+// Relative paths like "./" or "./sub" are joined with workDir so PowerShell
+// always receives a fully-qualified Windows path.
+func resolveCopyDst(dst, workDir string) string {
+	win := toWindowsPath(dst)
+	// Already absolute: has a drive letter (e.g. C:\) or leading backslash.
+	if len(win) >= 2 && win[1] == ':' {
+		return win
+	}
+	if strings.HasPrefix(win, `\`) {
+		return win
+	}
+	// Relative: resolve against workDir (default to C:\ if no WORKDIR set).
+	base := workDir
+	if base == "" {
+		base = `C:\`
+	}
+	base = toWindowsPath(base)
+	// Strip leading .\ or ./ from the relative part.
+	rel := strings.TrimPrefix(win, `.\\`)
+	rel = strings.TrimPrefix(rel, `./`)
+	rel = strings.TrimPrefix(rel, `.`)
+	rel = strings.TrimPrefix(rel, `\`)
+	if rel == "" {
+		return base
+	}
+	return filepath.Join(base, rel)
 }

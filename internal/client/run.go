@@ -4,8 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/asbassan/barge/internal/network"
@@ -20,11 +19,6 @@ const (
 	labelEndpoint = "barge.endpoint"
 	labelLogFile  = "barge.logfile"
 )
-
-// containerLogPath returns the path to a container's log file.
-func containerLogPath(id string) string {
-	return filepath.Join(os.Getenv("ProgramData"), "barge", "logs", id+".log")
-}
 
 // Isolation selects the Windows container isolation mode.
 type Isolation string
@@ -45,6 +39,7 @@ type RunOptions struct {
 	Volumes   []string  // -v host:container
 	Ports     []string  // -p hostPort:containerPort[/proto]
 	Isolation Isolation // --isolation hyperv|process (default: hyperv)
+	Memory    string    // --memory: memory limit (e.g. "512m", "2g")
 }
 
 // Run creates and starts a Hyper-V isolated Windows container.
@@ -59,6 +54,14 @@ func (cl *Client) Run(ctx context.Context, opts RunOptions) (id string, err erro
 	id = opts.Name
 	if id == "" {
 		id = randomName()
+	}
+
+	// Fail early with a friendly message if a container with this name already exists.
+	if _, lerr := cl.c.LoadContainer(ctx, id); lerr == nil {
+		return "", fmt.Errorf(
+			"container named %q already exists\n\n  Remove it first:\n    barge rm %s\n  Or force-remove:\n    barge rm -f %s",
+			id, id, id,
+		)
 	}
 
 	// Set up HCN NAT network and create an endpoint for this container.
@@ -103,6 +106,13 @@ func (cl *Client) Run(ctx context.Context, opts RunOptions) (id string, err erro
 		}
 		specOpts = append(specOpts, withMappedDirectories(mounts))
 	}
+	if opts.Memory != "" {
+		memBytes, err := parseMemoryBytes(opts.Memory)
+		if err != nil {
+			return "", fmt.Errorf("invalid --memory value %q: %w", opts.Memory, err)
+		}
+		specOpts = append(specOpts, withMemoryLimit(memBytes))
+	}
 
 	labels := map[string]string{
 		labelEndpoint: endpointID,
@@ -110,12 +120,10 @@ func (cl *Client) Run(ctx context.Context, opts RunOptions) (id string, err erro
 
 	var ioCreator cio.Creator
 	if opts.Detach {
-		logPath := containerLogPath(id)
-		if mkErr := os.MkdirAll(filepath.Dir(logPath), 0755); mkErr != nil {
-			return "", fmt.Errorf("cannot create log directory: %w", mkErr)
-		}
-		labels[labelLogFile] = logPath
-		ioCreator = cio.LogFile(logPath)
+		// containerd-shim-runhcs-v1 (Windows) only accepts binary:// or null IO —
+		// cio.LogFile produces a file:// URI that the shim rejects.
+		// Use NullIO for detached containers; output goes to the containerd shim log.
+		ioCreator = cio.NullIO
 	} else {
 		ioCreator = cio.NewCreator(cio.WithStdio)
 	}
@@ -159,11 +167,13 @@ func (cl *Client) Run(ctx context.Context, opts RunOptions) (id string, err erro
 	if _, delErr := task.Delete(ctx); delErr != nil {
 		// Non-fatal.
 	}
-	if opts.Remove {
-		network.DeleteEndpoint(endpointID)
-		if delErr := container.Delete(ctx, containerd.WithSnapshotCleanup); delErr != nil {
-			fmt.Printf("warning: could not remove container %s: %v\n", id, delErr)
-		}
+	// Foreground containers are always removed on exit — they have no use after
+	// the command returns. (Detached containers persist until explicitly stopped
+	// and removed.) The --rm flag is a no-op for foreground runs but kept for
+	// compatibility with muscle memory from Docker.
+	network.DeleteEndpoint(endpointID)
+	if delErr := container.Delete(ctx, containerd.WithSnapshotCleanup); delErr != nil {
+		fmt.Printf("warning: could not remove container %s: %v\n", id, delErr)
 	}
 
 	if exitStatus.Error() != nil {
@@ -284,6 +294,51 @@ func parsePortMappings(specs []string) ([]network.PortMapping, error) {
 		result = append(result, pm)
 	}
 	return result, nil
+}
+
+// withMemoryLimit sets the Hyper-V container memory limit in the OCI spec.
+func withMemoryLimit(bytes uint64) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Windows == nil {
+			s.Windows = &specs.Windows{}
+		}
+		if s.Windows.Resources == nil {
+			s.Windows.Resources = &specs.WindowsResources{}
+		}
+		if s.Windows.Resources.Memory == nil {
+			s.Windows.Resources.Memory = &specs.WindowsMemoryResources{}
+		}
+		s.Windows.Resources.Memory.Limit = &bytes
+		return nil
+	}
+}
+
+// parseMemoryBytes converts a human-readable memory string to bytes.
+// Accepts: "512m", "512M", "2g", "2G", or a raw integer (bytes).
+func parseMemoryBytes(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty value")
+	}
+	last := s[len(s)-1]
+	var multiplier uint64 = 1
+	numStr := s
+	switch last {
+	case 'k', 'K':
+		multiplier = 1024
+		numStr = s[:len(s)-1]
+	case 'm', 'M':
+		multiplier = 1024 * 1024
+		numStr = s[:len(s)-1]
+	case 'g', 'G':
+		multiplier = 1024 * 1024 * 1024
+		numStr = s[:len(s)-1]
+	}
+	n, err := strconv.ParseUint(numStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a valid number: %w", err)
+	}
+	return n * multiplier, nil
 }
 
 var adjectives = []string{

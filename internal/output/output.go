@@ -3,7 +3,9 @@ package output
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -20,11 +22,60 @@ var (
 	Bold    = color.New(color.Bold)
 )
 
-func Infof(format string, args ...any)  { Info.Fprintf(os.Stdout, format+"\n", args...) }
-func Warnf(format string, args ...any)  { Warn.Fprintf(os.Stderr, "WARNING: "+format+"\n", args...) }
-func Errorf(format string, args ...any) { Error.Fprintf(os.Stderr, "Error: "+format+"\n", args...) }
+// LogPath is the fixed path for the BARGE activity log.
+const LogPath = `C:\ProgramData\barge\logs\barge.log`
+
+var (
+	logMu   sync.Mutex
+	logFile *os.File
+)
+
+// InitLog opens (or creates) the log file and writes a session header.
+// Call once at startup; errors are non-fatal — logging silently degrades.
+func InitLog(invocation string) {
+	if err := os.MkdirAll(filepath.Dir(LogPath), 0755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	logMu.Lock()
+	logFile = f
+	logMu.Unlock()
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	logWrite("----", fmt.Sprintf("=== barge %s  (%s) ===", invocation, ts))
+}
+
+func logWrite(level, msg string) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if logFile == nil {
+		return
+	}
+	ts := time.Now().Format("15:04:05")
+	fmt.Fprintf(logFile, "%s  [%s]  %s\n", ts, level, msg)
+}
+
+func Infof(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	Info.Fprintln(os.Stdout, msg)
+	logWrite("INFO", msg)
+}
+func Warnf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	Warn.Fprintf(os.Stderr, "WARNING: %s\n", msg)
+	logWrite("WARN", msg)
+}
+func Errorf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	Error.Fprintf(os.Stderr, "Error: %s\n", msg)
+	logWrite("ERR ", msg)
+}
 func Successf(format string, args ...any) {
-	Success.Fprintf(os.Stdout, "✓ "+format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	Success.Fprintf(os.Stdout, "✓ %s\n", msg)
+	logWrite("OK  ", msg)
 }
 
 func PrintTable(headers []string, rows [][]string) {

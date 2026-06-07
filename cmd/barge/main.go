@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/asbassan/barge/internal/build"
 	"github.com/asbassan/barge/internal/client"
@@ -46,9 +49,13 @@ Examples:
   barge stop <container-id>`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			// Skip checks for commands that don't touch the daemon.
-			skip := map[string]bool{"version": true, "help": true, "completion": true, "init": true, "convert": true}
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Log every invocation (skip tail itself to avoid log-about-log noise).
+			if cmd.Name() != "tail" {
+				output.InitLog(cmd.Name())
+			}
+			// Skip preflight checks for commands that don't touch the daemon.
+			skip := map[string]bool{"version": true, "help": true, "completion": true, "init": true, "convert": true, "tail": true}
 			if skip[cmd.Name()] {
 				return nil
 			}
@@ -63,6 +70,7 @@ Examples:
 	root.AddCommand(
 		newVersionCmd(),
 		newInitCmd(),
+		newTailCmd(),
 		newConvertCmd(),
 		newPullCmd(),
 		newImagesCmd(),
@@ -330,9 +338,11 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Image = args[0]
 			opts.Isolation = client.Isolation(isolation)
-
-			if cmd.ArgsLenAtDash() >= 0 {
-				opts.Args = args[cmd.ArgsLenAtDash():]
+			// Everything after the image name is the container command + args.
+			// SetInterspersed(false) below ensures flags like -t are not parsed
+			// by cobra once the image name is seen.
+			if len(args) > 1 {
+				opts.Args = args[1:]
 			}
 
 			if envFile != "" {
@@ -369,6 +379,10 @@ Examples:
 	cmd.Flags().StringArrayVarP(&opts.Volumes, "volume", "v", nil, "Bind mount a volume (host:container[:ro])")
 	cmd.Flags().StringArrayVarP(&opts.Ports, "publish", "p", nil, "Publish a port (host:container[/proto])")
 	cmd.Flags().StringVar(&isolation, "isolation", "hyperv", "Isolation mode: hyperv (default) or process")
+	cmd.Flags().StringVarP(&opts.Memory, "memory", "m", "", "Memory limit (e.g. 512m, 2g). Default: no limit (Hyper-V manages dynamically)")
+	// Stop cobra from parsing flags once the image name (first non-flag arg) is
+	// seen, so arguments like `ping -t 127.0.0.1` pass through to the container.
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
@@ -718,7 +732,7 @@ Examples:
 	}
 
 	cmd.Flags().StringVarP(&tag, "tag", "t", "", "Name and optionally tag for the output image (required)")
-	cmd.Flags().StringVar(&bargefilePath, "file", "Bargefile", "Path to the Bargefile")
+	cmd.Flags().StringVarP(&bargefilePath, "file", "f", "Bargefile", "Path to the Bargefile or Dockerfile")
 	cmd.Flags().StringArrayVar(&buildArgs, "build-arg", nil, "Set build-time variables (KEY=VALUE)")
 	return cmd
 }
@@ -828,6 +842,98 @@ func newPushCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// ── tail ──────────────────────────────────────────────────────────────────────
+
+func newTailCmd() *cobra.Command {
+	var follow bool
+	var lines int
+
+	cmd := &cobra.Command{
+		Use:   "tail",
+		Short: "Show the BARGE activity log",
+		Long: `Display recent entries from the BARGE log file.
+
+Log file: ` + output.LogPath + `
+
+Open a second terminal and run 'barge tail -f' while a build or pull is running
+to monitor progress in real time.
+
+Examples:
+  barge tail           # show last 50 lines
+  barge tail -n 100    # show last 100 lines
+  barge tail -f        # follow in real time (Ctrl+C to stop)`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return tailLog(cmd.Context(), output.LogPath, lines, follow)
+		},
+	}
+
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow log output in real time")
+	cmd.Flags().IntVarP(&lines, "lines", "n", 50, "Number of recent lines to show")
+	return cmd
+}
+
+// tailLog prints the last n lines of path, then optionally follows it.
+func tailLog(ctx context.Context, path string, n int, follow bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("No log file yet at %s\n", path)
+			fmt.Println("Run any barge command to create it.")
+			return nil
+		}
+		return fmt.Errorf("cannot open log: %w", err)
+	}
+	defer f.Close()
+
+	// Print last n lines.
+	lines, err := lastNLines(f, n)
+	if err != nil {
+		return err
+	}
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+
+	if !follow {
+		return nil
+	}
+
+	// Follow mode: seek to end, poll for new content every 300ms.
+	offset, _ := f.Seek(0, io.SeekEnd)
+	fmt.Println("--- following (Ctrl+C to stop) ---")
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(300 * time.Millisecond):
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return err
+		}
+		n, err := io.Copy(os.Stdout, f)
+		offset += n
+		if err != nil && err != io.EOF {
+			return err
+		}
+	}
+}
+
+// lastNLines returns the last n lines of an open file.
+func lastNLines(f *os.File, n int) ([]string, error) {
+	scanner := bufio.NewScanner(f)
+	var all []string
+	for scanner.Scan() {
+		all = append(all, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(all) <= n {
+		return all, nil
+	}
+	return all[len(all)-n:], nil
 }
 
 // ── stats ─────────────────────────────────────────────────────────────────────
