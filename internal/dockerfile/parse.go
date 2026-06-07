@@ -156,14 +156,20 @@ func Parse(r io.Reader) (*build.Bargefile, []string, error) {
 }
 
 // readLines reads the file joining backslash-continued lines into single
-// logical lines, and stripping blank lines and comments.
+// logical lines, and stripping blank lines, comments, and a leading UTF-8 BOM.
 func readLines(r io.Reader) ([]string, error) {
 	scanner := bufio.NewScanner(r)
 	var lines []string
 	var buf strings.Builder
+	first := true
 
 	for scanner.Scan() {
-		trimmed := strings.TrimSpace(scanner.Text())
+		text := scanner.Text()
+		if first {
+			text = strings.TrimPrefix(text, "\xef\xbb\xbf") // strip UTF-8 BOM
+			first = false
+		}
+		trimmed := strings.TrimSpace(text)
 
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue

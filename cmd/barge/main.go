@@ -48,7 +48,7 @@ Examples:
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// Skip checks for commands that don't touch the daemon.
-			skip := map[string]bool{"version": true, "help": true, "completion": true, "init": true}
+			skip := map[string]bool{"version": true, "help": true, "completion": true, "init": true, "convert": true}
 			if skip[cmd.Name()] {
 				return nil
 			}
@@ -63,6 +63,7 @@ Examples:
 	root.AddCommand(
 		newVersionCmd(),
 		newInitCmd(),
+		newConvertCmd(),
 		newPullCmd(),
 		newImagesCmd(),
 		newRmiCmd(),
@@ -135,6 +136,77 @@ after rebooting to complete the remaining steps.`,
 			return setup.RunInit()
 		},
 	}
+}
+
+// ── convert ───────────────────────────────────────────────────────────────────
+
+func newConvertCmd() *cobra.Command {
+	var (
+		inputFile  string
+		outputFile string
+		winVersion string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "convert",
+		Short: "Convert a Linux Dockerfile to a Windows-compatible Bargefile",
+		Long: `Parse a Dockerfile and rewrite it for Windows containers.
+
+Automatically:
+  • Replaces Linux base images with Windows equivalents
+    (python:3.11-slim → python:3.11-windowsservercore-ltsc2022)
+  • Converts Linux paths to Windows paths  (/app → C:\app)
+  • Translates common shell commands to PowerShell equivalents
+    (mkdir -p, rm -rf, curl, wget, ln -s, cp, touch)
+  • Merges ENTRYPOINT into CMD
+  • Skips no-op instructions (chmod, chown, apt-get) with warnings
+
+Examples:
+  barge convert -f Dockerfile               # preview on stdout
+  barge convert -f Dockerfile -o Bargefile  # write to file`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			f, err := os.Open(inputFile)
+			if err != nil {
+				return fmt.Errorf("cannot open %s: %w", inputFile, err)
+			}
+			defer f.Close()
+
+			parsed, parseWarnings, err := dockerfile.Parse(f)
+			if err != nil {
+				return fmt.Errorf("parse error: %w", err)
+			}
+
+			result, err := dockerfile.Convert(parsed, winVersion)
+			if err != nil {
+				return fmt.Errorf("conversion error: %w", err)
+			}
+
+			// Print all warnings to stderr so stdout stays clean for the Bargefile.
+			for _, w := range parseWarnings {
+				output.Warnf("%s", w)
+			}
+			for _, w := range result.Warnings {
+				output.Warnf("%s", w)
+			}
+
+			formatted := dockerfile.FormatBargefile(result.Bargefile)
+
+			if outputFile == "" {
+				fmt.Print(formatted)
+			} else {
+				if err := os.WriteFile(outputFile, []byte(formatted), 0644); err != nil {
+					return fmt.Errorf("cannot write %s: %w", outputFile, err)
+				}
+				output.Successf("Written to %s", outputFile)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&inputFile, "file", "f", "Dockerfile", "Path to the Dockerfile")
+	cmd.Flags().StringVarP(&outputFile, "output", "o", "", "Write converted Bargefile to this path (default: stdout)")
+	cmd.Flags().StringVar(&winVersion, "windows-version", "ltsc2022", "Windows release tag: ltsc2019, ltsc2022, ltsc2025")
+	return cmd
 }
 
 // ── pull ─────────────────────────────────────────────────────────────────────
@@ -604,7 +676,7 @@ Examples:
 
 			var bf *build.Bargefile
 			if isDockerfile(bargefilePath) {
-				output.Infof("Detected Dockerfile format — converting to Barge instructions")
+				output.Infof("Detected Dockerfile — converting to Windows container instructions")
 				parsed, warnings, err := dockerfile.Parse(f)
 				if err != nil {
 					return fmt.Errorf("parse error: %w", err)
@@ -612,7 +684,17 @@ Examples:
 				for _, w := range warnings {
 					output.Warnf("%s", w)
 				}
-				bf = parsed
+				result, err := dockerfile.Convert(parsed, "ltsc2022")
+				if err != nil {
+					return fmt.Errorf("conversion error: %w", err)
+				}
+				if result.ImageChanged {
+					output.Infof("Base image: %s → %s", result.OriginalFrom, result.WindowsFrom)
+				}
+				for _, w := range result.Warnings {
+					output.Warnf("%s", w)
+				}
+				bf = result.Bargefile
 			} else {
 				parsed, err := build.Parse(f)
 				if err != nil {
