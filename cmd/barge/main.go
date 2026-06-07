@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/asbassan/barge/internal/build"
 	"github.com/asbassan/barge/internal/client"
+	"github.com/asbassan/barge/internal/dockerfile"
 	"github.com/asbassan/barge/internal/output"
 	"github.com/asbassan/barge/internal/preflight"
 	"github.com/asbassan/barge/internal/setup"
@@ -296,6 +298,12 @@ Examples:
 	cmd.Flags().StringArrayVarP(&opts.Ports, "publish", "p", nil, "Publish a port (host:container[/proto])")
 	cmd.Flags().StringVar(&isolation, "isolation", "hyperv", "Isolation mode: hyperv (default) or process")
 	return cmd
+}
+
+// isDockerfile returns true when path looks like a Dockerfile by name.
+func isDockerfile(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	return base == "dockerfile" || strings.HasSuffix(base, ".dockerfile")
 }
 
 // readEnvFile parses KEY=VALUE lines from path, skipping blanks and # comments.
@@ -594,9 +602,23 @@ Examples:
 			}
 			defer f.Close()
 
-			bf, err := build.Parse(f)
-			if err != nil {
-				return fmt.Errorf("parse error: %w", err)
+			var bf *build.Bargefile
+			if isDockerfile(bargefilePath) {
+				output.Infof("Detected Dockerfile format — converting to Barge instructions")
+				parsed, warnings, err := dockerfile.Parse(f)
+				if err != nil {
+					return fmt.Errorf("parse error: %w", err)
+				}
+				for _, w := range warnings {
+					output.Warnf("%s", w)
+				}
+				bf = parsed
+			} else {
+				parsed, err := build.Parse(f)
+				if err != nil {
+					return fmt.Errorf("parse error: %w", err)
+				}
+				bf = parsed
 			}
 
 			if tag == "" {
