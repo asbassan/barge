@@ -10,6 +10,7 @@ import (
 	"github.com/asbassan/barge/internal/client"
 	"github.com/asbassan/barge/internal/output"
 	"github.com/asbassan/barge/internal/preflight"
+	"github.com/asbassan/barge/internal/setup"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -45,7 +46,7 @@ Examples:
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// Skip checks for commands that don't touch the daemon.
-			skip := map[string]bool{"version": true, "help": true, "completion": true}
+			skip := map[string]bool{"version": true, "help": true, "completion": true, "init": true}
 			if skip[cmd.Name()] {
 				return nil
 			}
@@ -59,6 +60,7 @@ Examples:
 
 	root.AddCommand(
 		newVersionCmd(),
+		newInitCmd(),
 		newPullCmd(),
 		newImagesCmd(),
 		newRmiCmd(),
@@ -103,6 +105,32 @@ func newVersionCmd() *cobra.Command {
 			}
 			fmt.Printf("containerd version %s\n", ctrdVer)
 			return nil
+		},
+	}
+}
+
+// ── init ─────────────────────────────────────────────────────────────────────
+
+func newInitCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "init",
+		Short: "Install BARGE prerequisites (Hyper-V, containerd)",
+		Long: `Set up everything BARGE needs to run Windows containers.
+
+Run this once on a new machine. It will:
+  1. Enable Hyper-V
+  2. Enable the Windows Containers feature
+  3. Download and install containerd
+  4. Start the containerd service
+
+Requires administrator privileges. A reboot may be needed after enabling
+Windows features — barge init will tell you if so, and you can re-run it
+after rebooting to complete the remaining steps.`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := preflight.CheckAdmin(); err != nil {
+				return err
+			}
+			return setup.RunInit()
 		},
 	}
 }

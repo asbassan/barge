@@ -33,6 +33,9 @@ func Check() error {
 	return nil
 }
 
+// CheckAdmin returns an error if the current process is not running as Administrator.
+func CheckAdmin() error { return checkAdmin() }
+
 func checkAdmin() error {
 	var sid *windows.SID
 	err := windows.AllocateAndInitializeSid(
